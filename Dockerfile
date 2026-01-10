@@ -1,4 +1,4 @@
-FROM python:3.11-slim
+FROM python:3.10-slim
 
 WORKDIR /app
 
@@ -26,6 +26,7 @@ ENV PORT=8080
 
 # Use Gunicorn to run the Flask app
 CMD exec gunicorn --bind :$PORT --workers 1 --threads 4 --timeout 300 app:app_flask
+
 
 
 
