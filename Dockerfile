@@ -13,8 +13,10 @@ RUN apt-get update && apt-get install -y \
 
 # Copy requirements and install
 COPY requirements.txt .
-RUN pip install --upgrade pip
-RUN pip install --no-cache-dir -r requirements.txt
+
+RUN pip install --upgrade pip \
+ && pip install --no-cache-dir onnxruntime==1.16.3 \
+ && pip install --no-cache-dir -r requirements.txt
 
 # Copy the rest of the app
 COPY . .
@@ -24,6 +26,7 @@ ENV PORT=8080
 
 # Use Gunicorn to run the Flask app
 CMD exec gunicorn --bind :$PORT --workers 1 --threads 4 --timeout 300 app:app_flask
+
 
 
 
