@@ -18,7 +18,8 @@ face_app = None
 swapper = None
 models_loaded = False
 
-
+# Preload models so container is ready immediately on start
+init_models()
 
 def download_model_if_needed():
     if os.path.exists(MODEL_LOCAL_PATH):
@@ -500,7 +501,3 @@ def swap_selected():
         print(f"Error in swap_selected: {e}")
         traceback.print_exc()
         return jsonify({"error": str(e)}), 500
-
-if __name__ == "__main__":
-    port = int(os.environ.get("PORT", "5000"))
-    app_flask.run(host="0.0.0.0", port=port, debug=False, threaded=False)
