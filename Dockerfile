@@ -1,28 +1,20 @@
+# Dockerfile example
 FROM python:3.11-slim
-
-# Install system dependencies required for ML packages
-RUN apt-get update && apt-get install -y \
-    build-essential \
-    gcc \
-    g++ \
-    cmake \
-    libgl1 \
-    libglib2.0-0 \
-    && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
 COPY requirements.txt .
-
-# Upgrade pip first
-RUN pip install --upgrade pip
-
-# Install Python dependencies
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY . .
 
-CMD ["python", "app.py"]
+# Cloud Run automatically sets PORT env variable
+ENV PORT=8080
+
+# Use Gunicorn for production
+CMD exec gunicorn --bind :$PORT --workers 1 --threads 4 --timeout 300 main:app_flask
+
+
 
 
 
