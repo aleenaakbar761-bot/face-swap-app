@@ -1,149 +1,216 @@
 import os
+import sys
 import io
+import cv2
+import base64
+import numpy as np
 import traceback
-from flask import Flask, request, jsonify, send_file
+from flask import Flask, request, send_file, jsonify
 
-# ------------------------
-# Critical imports
-# ------------------------
-try:
-    import numpy as np
-    import cv2
-    import base64
-    import insightface
-    from insightface.app import FaceAnalysis
-    from google.cloud import storage
-except ImportError as e:
-    print(f"Critical dependency missing: {e}")
-    raise e  # Fail fast, container won't start if imports fail
-
-# ------------------------
-# Flask app
-# ------------------------
-app_flask = Flask(__name__)
-
-# ------------------------
 # Globals
-# ------------------------
+app_flask = Flask(__name__)
 face_app = None
 swapper = None
 models_loaded = False
 
+# Model paths
 MODEL_LOCAL_PATH = "/tmp/inswapper_128.onnx"
 BUCKET_NAME = "face-swap-app"
 MODEL_BLOB_PATH = "face_swap_app/models/inswapper_128.onnx"
 
-# ------------------------
-# Utilities
-# ------------------------
 def download_model_if_needed():
-    if os.path.exists(MODEL_LOCAL_PATH):
-        return True
+    """Download model from GCS if not present."""
+    from google.cloud import storage
 
-    try:
-        print("Downloading model from GCS...")
-        client = storage.Client()
-        bucket = client.bucket(BUCKET_NAME)
-        blob = bucket.blob(MODEL_BLOB_PATH)
-        blob.download_to_filename(MODEL_LOCAL_PATH)
-        print("Model downloaded successfully.")
-        return True
-    except Exception as e:
-        print(f"Failed to download model: {e}")
-        traceback.print_exc()
-        return False
+    if os.path.exists(MODEL_LOCAL_PATH):
+        return
+
+    print("Downloading model from GCS...")
+    client = storage.Client()
+    bucket = client.bucket(BUCKET_NAME)
+    blob = bucket.blob(MODEL_BLOB_PATH)
+    blob.download_to_filename(MODEL_LOCAL_PATH)
+    print("Model downloaded.")
 
 def init_models():
-    """Initialize face detection and swap models safely."""
-    global face_app, swapper, models_loaded
-
-    if models_loaded:
-        return True
+    """Initialize all imports and AI models. Exit if fails."""
+    global face_app, swapper, models_loaded, insightface
 
     try:
-        # Ensure model file exists
-        if not download_model_if_needed():
-            raise RuntimeError("Model file could not be downloaded.")
+        print("Importing InsightFace...")
+        import insightface
+        from insightface.app import FaceAnalysis
 
-        # Load FaceAnalysis model
-        if face_app is None:
-            print("Loading FaceAnalysis model...")
-            face_app = FaceAnalysis(name='buffalo_l', providers=['CPUExecutionProvider'])
-            face_app.prepare(ctx_id=-1, det_size=(320, 320))
-            print("FaceAnalysis loaded.")
+        # Download the face swapper model first
+        download_model_if_needed()
+
+        # Load face detection/analysis model
+        print("Loading face analysis model...")
+        face_app = FaceAnalysis(name='buffalo_l', providers=['CPUExecutionProvider'])
+        face_app.prepare(ctx_id=-1, det_size=(320, 320))
+        print("Face analysis model loaded.")
 
         # Load face swapper model
-        if swapper is None:
-            print("Loading InSwapper model...")
-            swapper = insightface.model_zoo.get_model(
-                MODEL_LOCAL_PATH, providers=['CPUExecutionProvider']
-            )
-            print("InSwapper model loaded.")
+        print("Loading swapper model...")
+        swapper = insightface.model_zoo.get_model(MODEL_LOCAL_PATH, providers=['CPUExecutionProvider'])
+        print("Swapper model loaded.")
 
         models_loaded = True
-        return True
+        print("All models loaded successfully!")
+
     except Exception as e:
-        print(f"Model initialization failed: {e}")
+        print("Failed to initialize models or imports!")
         traceback.print_exc()
-        models_loaded = False
-        return False
+        sys.exit(1)  # Stop container immediately
 
-# ------------------------
+# Helper functions
+def read_image_from_request(file_storage):
+    data = np.frombuffer(file_storage.read(), np.uint8)
+    img = cv2.imdecode(data, cv2.IMREAD_COLOR)
+    return img
+
+def resize_image(img, max_size=1024):
+    h, w = img.shape[:2]
+    if max(h, w) > max_size:
+        scale = max_size / max(h, w)
+        img = cv2.resize(img, None, fx=scale, fy=scale)
+    return img
+
+def extract_face_crop(img, face, padding=30, target_size=150):
+    bbox = face.bbox.astype(int)
+    x1, y1, x2, y2 = bbox
+    h, w = img.shape[:2]
+    x1 = max(0, x1 - padding)
+    y1 = max(0, y1 - padding)
+    x2 = min(w, x2 + padding)
+    y2 = min(h, y2 + padding)
+    face_crop = img[y1:y2, x1:x2]
+    face_crop = cv2.resize(face_crop, (target_size, target_size))
+    return face_crop
+
+def create_faces_grid(faces_list, face_size=150):
+    if len(faces_list) == 0:
+        blank = np.zeros((face_size, face_size, 3), dtype=np.uint8)
+        cv2.putText(blank, "No faces", (10, face_size//2),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+        return blank
+
+    n = len(faces_list)
+    cols = min(n, 4)
+    rows = (n + cols - 1) // cols
+    grid_h = rows * face_size
+    grid_w = cols * face_size
+    grid = np.zeros((grid_h, grid_w, 3), dtype=np.uint8)
+
+    for i, face_img in enumerate(faces_list):
+        row = i // cols
+        col = i % cols
+        y = row * face_size
+        x = col * face_size
+        grid[y:y+face_size, x:x+face_size] = face_img
+        cv2.putText(grid, str(i), (x + 5, y + 25),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+
+    return grid
+
 # Routes
-# ------------------------
-@app_flask.route("/health", methods=["GET"])
-def health():
-    """Check if models are loaded."""
-    return jsonify({"status": "ok", "models_loaded": models_loaded}), 200
-
 @app_flask.route("/", methods=["GET"])
 def root():
     return "OK", 200
 
-# ------------------------
-# Start-up check
-# ------------------------
-# Fail fast if models cannot be loaded
-if not init_models():
-    print("Critical error: models could not be initialized. Exiting.")
-    raise RuntimeError("Models initialization failed. Container cannot start.")
+@app_flask.route("/health", methods=["GET"])
+def health():
+    return jsonify({"status": "ok", "models_loaded": models_loaded}), 200
 
-# ------------------------
-# You can now safely add other endpoints that use face_app and swapper
-# ------------------------
-
-# Example:
-@app_flask.route("/detect_faces", methods=["POST"])
-def detect_faces():
+# Detect faces in source image
+@app_flask.route("/detect_source", methods=["POST"])
+def detect_source():
     try:
         if not models_loaded:
-            return jsonify({"error": "Models not loaded."}), 503
+            return jsonify({"error": "Models not loaded"}), 503
+        if "source" not in request.files:
+            return jsonify({"error": "Missing 'source' file"}), 400
 
-        if "image" not in request.files:
-            return jsonify({"error": "Missing 'image' file."}), 400
+        src_img = read_image_from_request(request.files["source"])
+        if src_img is None:
+            return jsonify({"error": "Invalid image data"}), 400
 
-        file = request.files["image"]
-        data = np.frombuffer(file.read(), np.uint8)
-        img = cv2.imdecode(data, cv2.IMREAD_COLOR)
+        src_img = resize_image(src_img)
+        src_faces = face_app.get(src_img)
 
-        faces = face_app.get(img)
-        results = []
-        for i, face in enumerate(faces):
-            bbox = face.bbox.astype(int)
-            crop = img[bbox[1]:bbox[3], bbox[0]:bbox[2]]
-            _, buf = cv2.imencode(".jpg", crop)
-            b64_img = base64.b64encode(buf.tobytes()).decode("utf-8")
-            results.append({"index": i, "face": b64_img})
+        faces_data = []
+        for i, face in enumerate(src_faces):
+            crop = extract_face_crop(src_img, face)
+            ok, buf = cv2.imencode(".jpg", crop, [int(cv2.IMWRITE_JPEG_QUALITY), 90])
+            if ok:
+                b64_str = base64.b64encode(buf.tobytes()).decode('utf-8')
+                faces_data.append({"index": i, "image": b64_str})
 
-        return jsonify({"faces_detected": len(faces), "faces": results})
+        return jsonify({"count": len(faces_data), "faces": faces_data})
+
     except Exception as e:
-        print(f"Error in detect_faces: {e}")
+        print(f"Error in detect_source: {e}")
         traceback.print_exc()
         return jsonify({"error": str(e)}), 500
 
-# ------------------------
-# Run Flask
-# ------------------------
+# Swap faces endpoint
+@app_flask.route("/swap", methods=["POST"])
+def swap():
+    try:
+        if not models_loaded:
+            return jsonify({"error": "Models not loaded"}), 503
+        if "source" not in request.files or "target" not in request.files:
+            return jsonify({"error": "Missing files"}), 400
+
+        src_img = read_image_from_request(request.files["source"])
+        tgt_img = read_image_from_request(request.files["target"])
+        if src_img is None or tgt_img is None:
+            return jsonify({"error": "Invalid image data"}), 400
+
+        src_img = resize_image(src_img)
+        tgt_img = resize_image(tgt_img)
+
+        source_index = int(request.form.get("source_index", 0))
+        target_index = request.form.get("target_index", None)
+
+        src_faces = face_app.get(src_img)
+        tgt_faces = face_app.get(tgt_img)
+
+        if len(src_faces) == 0 or len(tgt_faces) == 0:
+            return jsonify({"error": "No faces detected"}), 400
+
+        if source_index >= len(src_faces):
+            source_index = 0
+        src_face = src_faces[source_index]
+
+        out_img = tgt_img.copy()
+        if target_index is not None:
+            target_index = int(target_index)
+            if target_index < len(tgt_faces):
+                out_img = swapper.get(out_img, tgt_faces[target_index], src_face, paste_back=True)
+        else:
+            for tgt_face in tgt_faces:
+                out_img = swapper.get(out_img, tgt_face, src_face, paste_back=True)
+                break
+
+        ok, buf = cv2.imencode(".jpg", out_img, [int(cv2.IMWRITE_JPEG_QUALITY), 90])
+        if not ok:
+            return jsonify({"error": "Failed to encode output image"}), 500
+
+        return send_file(io.BytesIO(buf.tobytes()), mimetype="image/jpeg",
+                         as_attachment=False, download_name="swap.jpg")
+
+    except Exception as e:
+        print(f"Error in swap: {e}")
+        traceback.print_exc()
+        return jsonify({"error": str(e)}), 500
+
+# Add more endpoints here (detect_target, swap_all, detect_faces, etc.) in same style
+
+# Ensure initialization happens **before server starts**
+init_models()
+
+# Run Flask only if this is the main process
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 8080))
-    app_flask.run(host="0.0.0.0", port=port)
+    print("Starting Flask server...")
+    app_flask.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))
