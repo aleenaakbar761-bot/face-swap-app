@@ -2,7 +2,7 @@ FROM python:3.10-slim
 
 WORKDIR /app
 
-# Install system dependencies
+# Install system dependencies for ONNX Runtime
 RUN apt-get update && apt-get install -y \
     build-essential \
     cmake \
@@ -12,21 +12,23 @@ RUN apt-get update && apt-get install -y \
     libstdc++6 \
     libgomp1 \
     libprotobuf17 \
- && rm -rf /var/lib/apt/lists/*
+    && rm -rf /var/lib/apt/lists/*
 
-# Copy requirements and install packages
+# Upgrade pip
+RUN pip install --upgrade pip
+
+# Copy requirements first
 COPY requirements.txt .
 
-# Upgrade pip and install CPU-only onnxruntime first
-RUN pip install --upgrade pip \
- && pip install --no-cache-dir onnxruntime==1.15.1 \
- && pip install --no-cache-dir -r requirements.txt
+# Install packages including onnxruntime
+RUN pip install --no-cache-dir onnxruntime==1.15.1 \
+    && pip install --no-cache-dir -r requirements.txt
 
-# Copy app source
+# Copy app code
 COPY . .
 
-# Cloud Run port
+# Cloud Run expects PORT
 ENV PORT=8080
 
-# Use Gunicorn
+# Use gunicorn with higher timeout for large model
 CMD ["gunicorn", "--bind", ":8080", "--workers", "1", "--threads", "4", "--timeout", "300", "app:app_flask"]
