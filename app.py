@@ -13,6 +13,9 @@ MODEL_LOCAL_PATH = "/tmp/inswapper_128.onnx"
 BUCKET_NAME = "face-swap-app"
 MODEL_BLOB_PATH = "face_swap_app/models/inswapper_128.onnx"
 
+@app_flask.route("/", methods=["GET"])
+def root():
+    return "OK", 200
 
 
 def download_model_if_needed():
@@ -72,7 +75,6 @@ swapper = None
 models_loaded = False
 
 # Preload models so container is ready immediately on start
-init_models()
 
 
 def read_image_from_request(file_storage):
@@ -504,4 +506,5 @@ def swap_selected():
         print(f"Error in swap_selected: {e}")
         traceback.print_exc()
         return jsonify({"error": str(e)}), 500
+
 
