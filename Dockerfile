@@ -1,4 +1,4 @@
-FROM python:3.10-slim
+FROM python:3.10
 
 WORKDIR /app
 
@@ -32,3 +32,4 @@ ENV PORT=8080
 
 # Use gunicorn with higher timeout for large model
 CMD ["gunicorn", "--bind", ":8080", "--workers", "1", "--threads", "4", "--timeout", "300", "app:app_flask"]
+
