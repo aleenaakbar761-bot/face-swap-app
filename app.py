@@ -3,25 +3,36 @@ import os
 import cv2
 import base64
 import numpy as np
-from flask import Flask, request, send_file, jsonify
-import insightface
-from insightface.app import FaceAnalysis
 import traceback
+from flask import Flask, request, send_file, jsonify
 from google.cloud import storage
+import json
 
+# ------------------------
+# Paths and GCS info
+# ------------------------
 MODEL_LOCAL_PATH = "/tmp/inswapper_128.onnx"
 BUCKET_NAME = "face-swap-app"
 MODEL_BLOB_PATH = "face_swap_app/models/inswapper_128.onnx"
 
-@app_flask.route("/", methods=["GET"])
-def root():
-    return "OK", 200
+# ------------------------
+# Flask app
+# ------------------------
+app_flask = Flask(__name__)
 
+# Globals for models
+face_app = None
+swapper = None
+models_loaded = False
+
+# ------------------------
+# Helper functions
+# ------------------------
 
 def download_model_if_needed():
+    """Download model from GCS if not already present"""
     if os.path.exists(MODEL_LOCAL_PATH):
         return
-
     print("Downloading model from GCS...")
     client = storage.Client()
     bucket = client.bucket(BUCKET_NAME)
@@ -29,15 +40,17 @@ def download_model_if_needed():
     blob.download_to_filename(MODEL_LOCAL_PATH)
     print("Model downloaded.")
 
-
 def init_models():
+    """Lazy-load insightface models"""
     global face_app, swapper, models_loaded
-
     if models_loaded:
         return True
-
     try:
-        # Load face detection / analysis model
+        # Lazy import
+        import insightface
+        from insightface.app import FaceAnalysis
+
+        # Load face analysis model
         if face_app is None:
             print("Loading face analysis model...")
             face_app = FaceAnalysis(
@@ -50,32 +63,19 @@ def init_models():
         # Load face swap model
         if swapper is None:
             print("Loading swapper model...")
-
             download_model_if_needed()
-
             swapper = insightface.model_zoo.get_model(
                 MODEL_LOCAL_PATH,
                 providers=['CPUExecutionProvider']
             )
-
             print("Swapper model loaded.")
 
         models_loaded = True
         return True
-
     except Exception as e:
         print(f"Error loading models: {e}")
         traceback.print_exc()
         return False
-
-
-app_flask = Flask(__name__)
-face_app = None
-swapper = None
-models_loaded = False
-
-# Preload models so container is ready immediately on start
-
 
 def read_image_from_request(file_storage):
     data = np.frombuffer(file_storage.read(), np.uint8)
@@ -104,32 +104,43 @@ def extract_face_crop(img, face, padding=30, target_size=150):
 def create_faces_grid(faces_list, face_size=150):
     if len(faces_list) == 0:
         blank = np.zeros((face_size, face_size, 3), dtype=np.uint8)
-        cv2.putText(blank, "No faces", (10, face_size//2), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+        cv2.putText(blank, "No faces", (10, face_size//2),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
         return blank
-    
+
     n = len(faces_list)
     cols = min(n, 4)
     rows = (n + cols - 1) // cols
-    
+
     grid_h = rows * face_size
     grid_w = cols * face_size
     grid = np.zeros((grid_h, grid_w, 3), dtype=np.uint8)
-    
+
     for i, face_img in enumerate(faces_list):
         row = i // cols
         col = i % cols
         y = row * face_size
         x = col * face_size
         grid[y:y+face_size, x:x+face_size] = face_img
-        cv2.putText(grid, str(i), (x + 5, y + 25), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
-    
+        cv2.putText(grid, str(i), (x + 5, y + 25),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
     return grid
+
+# ------------------------
+# Routes
+# ------------------------
+
+@app_flask.route("/", methods=["GET"])
+def root():
+    return "OK", 200
 
 @app_flask.route("/health", methods=["GET"])
 def health():
     return jsonify({"status": "ok", "models_loaded": models_loaded}), 200
 
-
+# ------------------------
+# Detection Endpoints
+# ------------------------
 
 @app_flask.route("/detect_source", methods=["POST"])
 def detect_source():
@@ -153,19 +164,15 @@ def detect_source():
             ok, buf = cv2.imencode(".jpg", crop, [int(cv2.IMWRITE_JPEG_QUALITY), 90])
             if ok:
                 b64_str = base64.b64encode(buf.tobytes()).decode('utf-8')
-                faces_data.append({
-                    "index": i,
-                    "image": b64_str
-                })
+                faces_data.append({"index": i, "image": b64_str})
 
-        return jsonify({
-            "count": len(faces_data),
-            "faces": faces_data
-        })
+        return jsonify({"count": len(faces_data), "faces": faces_data})
+
     except Exception as e:
         print(f"Error in detect_source: {e}")
         traceback.print_exc()
         return jsonify({"error": str(e)}), 500
+
 
 @app_flask.route("/detect_target", methods=["POST"])
 def detect_target():
@@ -183,22 +190,17 @@ def detect_target():
         tgt_img = resize_image(tgt_img)
         tgt_faces = face_app.get(tgt_img)
 
-        face_crops = []
-        for face in tgt_faces:
-            crop = extract_face_crop(tgt_img, face)
-            face_crops.append(crop)
-
+        face_crops = [extract_face_crop(tgt_img, f) for f in tgt_faces]
         grid = create_faces_grid(face_crops)
+
         ok, buf = cv2.imencode(".jpg", grid, [int(cv2.IMWRITE_JPEG_QUALITY), 90])
         if not ok:
             return jsonify({"error": "Failed to encode image."}), 500
 
-        return send_file(
-            io.BytesIO(buf.tobytes()),
-            mimetype="image/jpeg",
-            as_attachment=False,
-            download_name="target_faces.jpg"
-        )
+        return send_file(io.BytesIO(buf.tobytes()),
+                         mimetype="image/jpeg",
+                         as_attachment=False,
+                         download_name="target_faces.jpg")
     except Exception as e:
         print(f"Error in detect_target: {e}")
         traceback.print_exc()
@@ -236,18 +238,20 @@ def detect_both():
 
         label_h = 30
         max_w = max(src_w, tgt_w)
-        
+
         src_grid_padded = np.zeros((src_h, max_w, 3), dtype=np.uint8)
         src_grid_padded[:, :src_w] = src_grid
-        
+
         tgt_grid_padded = np.zeros((tgt_h, max_w, 3), dtype=np.uint8)
         tgt_grid_padded[:, :tgt_w] = tgt_grid
 
         src_label = np.zeros((label_h, max_w, 3), dtype=np.uint8)
-        cv2.putText(src_label, f"SOURCE FACES ({len(src_faces)})", (10, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
-        
+        cv2.putText(src_label, f"SOURCE FACES ({len(src_faces)})", (10, 22),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+
         tgt_label = np.zeros((label_h, max_w, 3), dtype=np.uint8)
-        cv2.putText(tgt_label, f"TARGET FACES ({len(tgt_faces)})", (10, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 0, 255), 2)
+        cv2.putText(tgt_label, f"TARGET FACES ({len(tgt_faces)})", (10, 22),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 0, 255), 2)
 
         combined = np.vstack([src_label, src_grid_padded, tgt_label, tgt_grid_padded])
 
@@ -255,22 +259,25 @@ def detect_both():
         if not ok:
             return jsonify({"error": "Failed to encode image."}), 500
 
-        return send_file(
-            io.BytesIO(buf.tobytes()),
-            mimetype="image/jpeg",
-            as_attachment=False,
-            download_name="detected_faces.jpg"
-        )
+        return send_file(io.BytesIO(buf.tobytes()),
+                         mimetype="image/jpeg",
+                         as_attachment=False,
+                         download_name="detected_faces.jpg")
+
     except Exception as e:
         print(f"Error in detect: {e}")
         traceback.print_exc()
         return jsonify({"error": str(e)}), 500
 
+# ------------------------
+# Swap Endpoints
+# ------------------------
+
 @app_flask.route("/swap", methods=["POST"])
 def swap():
     try:
         if not init_models():
-            return jsonify({"error": "Failed to load AI models. Please try again."}), 503
+            return jsonify({"error": "Failed to load AI models."}), 503
 
         if "source" not in request.files or "target" not in request.files:
             return jsonify({"error": "Missing files. Expect 'source' and 'target'."}), 400
@@ -300,7 +307,7 @@ def swap():
         src_face = src_faces[source_index]
 
         out_img = tgt_img.copy()
-        
+
         if target_index is not None:
             target_index = int(target_index)
             if target_index < len(tgt_faces):
@@ -313,22 +320,26 @@ def swap():
         ok, buf = cv2.imencode(".jpg", out_img, [int(cv2.IMWRITE_JPEG_QUALITY), 90])
         if not ok:
             return jsonify({"error": "Failed to encode output image."}), 500
-        return send_file(
-            io.BytesIO(buf.tobytes()),
-            mimetype="image/jpeg",
-            as_attachment=False,
-            download_name="swap.jpg"
-        )
+
+        return send_file(io.BytesIO(buf.tobytes()),
+                         mimetype="image/jpeg",
+                         as_attachment=False,
+                         download_name="swap.jpg")
+
     except Exception as e:
         print(f"Error in swap: {e}")
         traceback.print_exc()
         return jsonify({"error": str(e)}), 500
 
+# ------------------------
+# Swap all faces
+# ------------------------
+
 @app_flask.route("/swap_all", methods=["POST"])
 def swap_all():
     try:
         if not init_models():
-            return jsonify({"error": "Failed to load AI models. Please try again."}), 503
+            return jsonify({"error": "Failed to load AI models."}), 503
 
         if "source" not in request.files or "target" not in request.files:
             return jsonify({"error": "Missing files. Expect 'source' and 'target'."}), 400
@@ -363,23 +374,22 @@ def swap_all():
         ok, buf = cv2.imencode(".jpg", out_img, [int(cv2.IMWRITE_JPEG_QUALITY), 90])
         if not ok:
             return jsonify({"error": "Failed to encode output image."}), 500
-        return send_file(
-            io.BytesIO(buf.tobytes()),
-            mimetype="image/jpeg",
-            as_attachment=False,
-            download_name="swap.jpg"
-        )
+
+        return send_file(io.BytesIO(buf.tobytes()),
+                         mimetype="image/jpeg",
+                         as_attachment=False,
+                         download_name="swap.jpg")
     except Exception as e:
         print(f"Error in swap_all: {e}")
         traceback.print_exc()
         return jsonify({"error": str(e)}), 500
 
+# ------------------------
+# Detect faces from both images
+# ------------------------
+
 @app_flask.route("/detect_faces", methods=["POST"])
 def detect_faces():
-    """
-    Detects faces in both source and target images.
-    Returns all faces as base64 JPEGs with type identifier (source/target).
-    """
     try:
         if not init_models():
             return jsonify({"error": "Failed to load AI models."}), 503
@@ -406,22 +416,14 @@ def detect_faces():
             ok, buf = cv2.imencode(".jpg", crop, [int(cv2.IMWRITE_JPEG_QUALITY), 90])
             if ok:
                 b64_str = base64.b64encode(buf.tobytes()).decode('utf-8')
-                all_faces.append({
-                    "type": "source",
-                    "index": i,
-                    "image": b64_str
-                })
+                all_faces.append({"type": "source", "index": i, "image": b64_str})
 
         for i, face in enumerate(tgt_faces):
             crop = extract_face_crop(tgt_img, face)
             ok, buf = cv2.imencode(".jpg", crop, [int(cv2.IMWRITE_JPEG_QUALITY), 90])
             if ok:
                 b64_str = base64.b64encode(buf.tobytes()).decode('utf-8')
-                all_faces.append({
-                    "type": "target",
-                    "index": i,
-                    "image": b64_str
-                })
+                all_faces.append({"type": "target", "index": i, "image": b64_str})
 
         return jsonify({
             "source_count": len(src_faces),
@@ -433,19 +435,15 @@ def detect_faces():
         traceback.print_exc()
         return jsonify({"error": str(e)}), 500
 
+# ------------------------
+# Swap selected faces
+# ------------------------
+
 @app_flask.route("/swap_selected", methods=["POST"])
 def swap_selected():
-    """
-    Swaps selected faces between source and target images.
-    Expects:
-      - source: source image file
-      - target: target image file
-      - swaps: JSON string of swap pairs, e.g. [{"source_index": 0, "target_index": 1}]
-    Returns the output image with all specified swaps applied.
-    """
     try:
         if not init_models():
-            return jsonify({"error": "Failed to load AI models. Please try again."}), 503
+            return jsonify({"error": "Failed to load AI models."}), 503
 
         if "source" not in request.files or "target" not in request.files:
             return jsonify({"error": "Missing files. Expect 'source' and 'target'."}), 400
@@ -461,13 +459,12 @@ def swap_selected():
 
         swaps_json = request.form.get("swaps", "[]")
         try:
-            import json
             swaps = json.loads(swaps_json)
         except:
             return jsonify({"error": "Invalid 'swaps' format. Expected JSON array."}), 400
 
         if not isinstance(swaps, list) or len(swaps) == 0:
-            return jsonify({"error": "No swap pairs provided. Expected array of {source_index, target_index}."}), 400
+            return jsonify({"error": "No swap pairs provided."}), 400
 
         src_faces = face_app.get(src_img)
         tgt_faces = face_app.get(tgt_img)
@@ -495,16 +492,19 @@ def swap_selected():
         ok, buf = cv2.imencode(".jpg", out_img, [int(cv2.IMWRITE_JPEG_QUALITY), 90])
         if not ok:
             return jsonify({"error": "Failed to encode output image."}), 500
-        
-        return send_file(
-            io.BytesIO(buf.tobytes()),
-            mimetype="image/jpeg",
-            as_attachment=False,
-            download_name="swap_selected.jpg"
-        )
+
+        return send_file(io.BytesIO(buf.tobytes()),
+                         mimetype="image/jpeg",
+                         as_attachment=False,
+                         download_name="swap_selected.jpg")
+
     except Exception as e:
         print(f"Error in swap_selected: {e}")
         traceback.print_exc()
         return jsonify({"error": str(e)}), 500
 
-
+# ------------------------
+# Main
+# ------------------------
+if __name__ == "__main__":
+    app_flask.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))
