@@ -2,8 +2,10 @@ Flask==2.3.3
 numpy==1.24.4
 insightface
 opencv-python-headless
+onnxruntime
 gunicorn
 google-cloud-storage
+
 
 
 
